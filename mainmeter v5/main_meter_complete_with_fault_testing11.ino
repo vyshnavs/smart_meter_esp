@@ -14,7 +14,7 @@ const char* password = "123123123456";
 // =====================================
 // MQTT CONFIG (Backend IP)
 // =====================================
-const char* mqttServer = "192.168.219.171";
+const char* mqttServer = "192.168.127.171";
 const int mqttPort = 1883;
 
 // =====================================
@@ -31,7 +31,7 @@ Preferences preferences;
 // =====================================
 // BILLING CONFIGURATION
 // =====================================
-const unsigned long BILLING_SYNC_INTERVAL = 30000; // 1 hour in milliseconds
+const unsigned long BILLING_SYNC_INTERVAL = 30000; // 30 seconds for testing (change to 3600000 for 1 hour)
 unsigned long lastBillingSync = 0;
 unsigned long billingSequenceNo = 0;
 
@@ -46,8 +46,15 @@ bool relayState = true;             // Current relay state
 bool faultActive = false;
 
 // Code deployment tracking
-const char* firmwareVersion = "1.0.0";
-const char* deploymentDate = "2025-01-24";
+const char* firmwareVersion = "1.0.1";
+const char* deploymentDate = "2025-01-30";
+
+// =====================================
+// FAULT TESTING CONFIGURATION
+// =====================================
+const unsigned long FAULT_TEST_INTERVAL = 600000; // Send fault every 10 seconds
+unsigned long lastFaultTest = 0;
+int faultTestCounter = 0;
 
 // =====================================
 // PAIRED MODULES (MAX 10)
@@ -70,6 +77,9 @@ int pairedCount = 0;
 WiFiClient espClient;
 PubSubClient client(espClient);
 
+// Increase MQTT buffer size for large telemetry payloads
+#define MQTT_MAX_PACKET_SIZE 2048
+
 // =====================================
 // MQTT TOPICS
 // =====================================
@@ -81,6 +91,7 @@ String scanTopic       = "meter/" + String(deviceId) + "/scan";
 String pairAckTopic    = "meter/" + String(deviceId) + "/pair_ack";
 String billingSyncTopic = "meter/" + String(deviceId) + "/billing_sync";
 String ackTopic        = "meter/" + String(deviceId) + "/ack";
+String faultTopic      = "meter/" + String(deviceId) + "/fault";  // NEW: Fault topic
 
 // =====================================
 // ESP-NOW PAYLOAD STRUCTS
@@ -123,6 +134,19 @@ typedef struct {
   int unitIndex;
 } ModuleTelemetry;
 
+// NEW: Fault message from slave module
+typedef struct {
+  char type[16];           // "FAULT"
+  char moduleId[16];
+  int unitNumber;
+  char faultType[32];
+  char severity[16];
+  char description[128];
+  float measuredValue;
+  float thresholdValue;
+  char unit[16];
+} ModuleFault;
+
 // Store latest telemetry from each module
 struct ModuleData {
   char moduleId[16];
@@ -135,7 +159,7 @@ struct ModuleData {
   unsigned long lastUpdate;
 };
 
-ModuleData moduleDataCache[MAX_MODULES * 2];
+ModuleData moduleDataCache[MAX_MODULES * 10];  // Increased capacity
 int moduleDataCount = 0;
 
 // =====================================
@@ -156,6 +180,129 @@ const unsigned long ENERGY_UPDATE_INTERVAL = 1000; // Update energy every second
 
 unsigned long lastTelemetry = 0;
 unsigned long lastHeartbeat = 0;
+
+// =====================================
+// FAULT PUBLISHING FUNCTION
+// =====================================
+void publishFault(const char* source, const char* moduleId, int unitNumber, 
+                   const char* faultType, const char* severity, 
+                   const char* description, float measuredValue, 
+                   float thresholdValue, const char* unit) {
+  StaticJsonDocument<512> doc;
+  
+  doc["source"] = source;
+  
+  if (moduleId != nullptr) {
+    doc["moduleId"] = moduleId;
+  }
+  
+  if (unitNumber >= 0) {
+    doc["unitNumber"] = unitNumber;
+  }
+  
+  doc["faultType"] = faultType;
+  doc["severity"] = severity;
+  doc["description"] = description;
+  
+  if (measuredValue > 0) {
+    doc["measuredValue"] = measuredValue;
+  }
+  
+  if (thresholdValue > 0) {
+    doc["thresholdValue"] = thresholdValue;
+  }
+  
+  if (unit != nullptr && strlen(unit) > 0) {
+    doc["unit"] = unit;
+  }
+  
+  char buffer[512];
+  serializeJson(doc, buffer);
+  
+  if (client.publish(faultTopic.c_str(), buffer)) {
+    Serial.println("🚨 Fault published:");
+    Serial.print("  Source: ");
+    Serial.println(source);
+    Serial.print("  Type: ");
+    Serial.println(faultType);
+    Serial.print("  Severity: ");
+    Serial.println(severity);
+  } else {
+    Serial.println("❌ Fault publish failed");
+  }
+}
+
+// =====================================
+// FAULT TESTING FUNCTION
+// =====================================
+void testFaultPublishing() {
+  faultTestCounter++;
+  
+  // Cycle through different fault scenarios
+  int scenario = faultTestCounter % 4;
+  
+  switch (scenario) {
+    case 0:
+      // Main meter overvoltage
+      publishFault(
+        "mainMeter",
+        nullptr,
+        -1,
+        "overvoltage",
+        "critical",
+        "Voltage exceeded safe operating limits",
+        245.5,
+        240.0,
+        "V"
+      );
+      break;
+      
+    case 1:
+      // Main meter overcurrent
+      publishFault(
+        "mainMeter",
+        nullptr,
+        -1,
+        "overcurrent",
+        "warning",
+        "Current draw approaching maximum threshold",
+        9.8,
+        10.0,
+        "A"
+      );
+      break;
+      
+    case 2:
+      // Main meter low power factor
+      publishFault(
+        "mainMeter",
+        nullptr,
+        -1,
+        "low_power_factor",
+        "info",
+        "Power factor below optimal range",
+        0.75,
+        0.85,
+        ""
+      );
+      break;
+      
+    case 3:
+      // Main meter frequency deviation
+      publishFault(
+        "mainMeter",
+        nullptr,
+        -1,
+        "frequency_deviation",
+        "warning",
+        "Grid frequency outside normal range",
+        50.8,
+        50.5,
+        "Hz"
+      );
+      break;
+  }
+}
 
 // =====================================
 // NVS FUNCTIONS - BILLING STATE
@@ -275,22 +422,11 @@ void publishBillingSync() {
     accumulatedEnergyWh = 0.0;
     periodStartTimestamp = now;
     billingSequenceNo++;
+    
     saveBillingState();
   } else {
-    Serial.println("❌ Billing sync failed - will retry");
+    Serial.println("❌ Billing sync failed");
   }
-}
-
-// =====================================
-// HELPER FUNCTIONS
-// =====================================
-bool isModulePaired(const char* moduleId) {
-  for (int i = 0; i < pairedCount; i++) {
-    if (strcmp(pairedModules[i].moduleId, moduleId) == 0 && pairedModules[i].isPaired) {
-      return true;
-    }
-  }
-  return false;
 }
 
 // =====================================
@@ -298,142 +434,86 @@ bool isModulePaired(const char* moduleId) {
 // =====================================
 void loadPairedModules() {
   preferences.begin("modules", false);
+  
   pairedCount = preferences.getInt("count", 0);
   
-  Serial.print("📂 Loading ");
-  Serial.print(pairedCount);
-  Serial.println(" paired modules from NVS");
-  
   for (int i = 0; i < pairedCount && i < MAX_MODULES; i++) {
-    String key = "mod_" + String(i);
-    size_t len = preferences.getBytes(key.c_str(), &pairedModules[i], sizeof(PairedModule));
+    String key = "mod" + String(i);
+    size_t len = preferences.getBytesLength(key.c_str());
     
-    if (len > 0 && pairedModules[i].isPaired) {
-      Serial.print("  ✅ ");
-      Serial.print(pairedModules[i].moduleId);
-      Serial.print(" | MAC: ");
-      for (int j = 0; j < 6; j++) {
-        Serial.printf("%02X", pairedModules[i].macAddr[j]);
-        if (j < 5) Serial.print(":");
-      }
-      Serial.println();
+    if (len == sizeof(PairedModule)) {
+      preferences.getBytes(key.c_str(), &pairedModules[i], sizeof(PairedModule));
+      Serial.print("📦 Loaded: ");
+      Serial.println(pairedModules[i].moduleId);
     }
   }
   
   preferences.end();
+  
+  Serial.print("Total paired modules: ");
+  Serial.println(pairedCount);
 }
 
-void savePairedModule(const char* moduleId, const uint8_t* macAddr, int capacity) {
+void savePairedModules() {
   preferences.begin("modules", false);
   
-  for (int i = 0; i < pairedCount; i++) {
-    if (strcmp(pairedModules[i].moduleId, moduleId) == 0) {
-      Serial.println("⚠️ Module already paired, updating...");
-      memcpy(pairedModules[i].macAddr, macAddr, 6);
-      pairedModules[i].capacity = capacity;
-      pairedModules[i].isPaired = true;
-      
-      String key = "mod_" + String(i);
-      preferences.putBytes(key.c_str(), &pairedModules[i], sizeof(PairedModule));
-      preferences.end();
-      return;
-    }
-  }
+  preferences.putInt("count", pairedCount);
   
-  if (pairedCount < MAX_MODULES) {
-    strcpy(pairedModules[pairedCount].moduleId, moduleId);
-    memcpy(pairedModules[pairedCount].macAddr, macAddr, 6);
-    pairedModules[pairedCount].capacity = capacity;
-    pairedModules[pairedCount].isPaired = true;
-    
-    String key = "mod_" + String(pairedCount);
-    preferences.putBytes(key.c_str(), &pairedModules[pairedCount], sizeof(PairedModule));
-    
-    pairedCount++;
-    preferences.putInt("count", pairedCount);
-    
-    Serial.print("💾 Saved module: ");
-    Serial.println(moduleId);
-  } else {
-    Serial.println("❌ Max modules reached!");
+  for (int i = 0; i < pairedCount; i++) {
+    String key = "mod" + String(i);
+    preferences.putBytes(key.c_str(), &pairedModules[i], sizeof(PairedModule));
   }
   
   preferences.end();
-}
-
-void unpairModule(const char* moduleId) {
-  preferences.begin("modules", false);
-  
-  for (int i = 0; i < pairedCount; i++) {
-    if (strcmp(pairedModules[i].moduleId, moduleId) == 0) {
-      Serial.print("🗑️ Unpairing: ");
-      Serial.println(moduleId);
-      
-      if (esp_now_is_peer_exist(pairedModules[i].macAddr)) {
-        esp_now_del_peer(pairedModules[i].macAddr);
-      }
-      
-      for (int j = i; j < pairedCount - 1; j++) {
-        pairedModules[j] = pairedModules[j + 1];
-        String key = "mod_" + String(j);
-        preferences.putBytes(key.c_str(), &pairedModules[j], sizeof(PairedModule));
-      }
-      
-      pairedCount--;
-      preferences.putInt("count", pairedCount);
-      
-      String lastKey = "mod_" + String(pairedCount);
-      preferences.remove(lastKey.c_str());
-      
-      Serial.println("✅ Module unpaired");
-      preferences.end();
-      return;
-    }
-  }
-  
-  Serial.println("⚠️ Module not found");
-  preferences.end();
+  Serial.println("💾 Paired modules saved");
 }
 
 // =====================================
-// WIFI CONNECT
+// WIFI CONNECTION
 // =====================================
 void connectWiFi() {
-  Serial.print("Connecting to WiFi");
-  
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
   
+  Serial.print("Connecting to WiFi");
   while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
+    delay(300);
     Serial.print(".");
   }
   
   Serial.println("\n🟢 WiFi connected");
-  Serial.print("ESP IP: ");
+  Serial.print("📶 Channel: ");
+  Serial.println(WiFi.channel());
+  Serial.print("📡 IP: ");
   Serial.println(WiFi.localIP());
-  
-  uint8_t channel = WiFi.channel();
-  esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
-  
-  Serial.print("📶 WiFi / ESP-NOW Channel: ");
-  Serial.println(channel);
 }
 
 // =====================================
-// MQTT CONNECT
+// MQTT SETUP
 // =====================================
+void setupMQTT() {
+  client.setServer(mqttServer, mqttPort);
+  client.setCallback(onMQTTMessage);
+  client.setBufferSize(2048);
+}
+
 void connectMQTT() {
   while (!client.connected()) {
     Serial.println("Connecting to MQTT...");
     
+    // Use deviceId as both clientId and username, secretKey as password
     if (client.connect(
           String(deviceId).c_str(),
           String(deviceId).c_str(),
           secretKey
         )) {
       Serial.println("🟢 MQTT connected");
+      
+      // Subscribe to command topic
       client.subscribe(commandTopic.c_str());
+      Serial.print("📬 Subscribed to: ");
+      Serial.println(commandTopic);
+      
     } else {
       Serial.print("❌ MQTT failed, rc=");
       Serial.println(client.state());
@@ -443,216 +523,275 @@ void connectMQTT() {
 }
 
 // =====================================
-// MQTT COMMAND HANDLER
+// PUBLISH COMMAND ACK
+// =====================================
+void publishCommandAck(const char* command, const char* status, bool currentRelayState) {
+  StaticJsonDocument<128> doc;
+  
+  doc["command"] = command;
+  doc["status"] = status;
+  doc["relayState"] = currentRelayState;
+  doc["relayLocked"] = relayLockedByServer;
+  
+  char buffer[128];
+  serializeJson(doc, buffer);
+  
+  client.publish(ackTopic.c_str(), buffer);
+  Serial.print("✅ ACK sent: ");
+  Serial.println(command);
+}
+
+// =====================================
+// MQTT MESSAGE HANDLER
 // =====================================
 void onMQTTMessage(char* topic, byte* payload, unsigned int length) {
-  payload[length] = '\0';
-  String msg = String((char*)payload);
+  Serial.print("📥 Message on: ");
+  Serial.println(topic);
   
-  Serial.println("📨 MQTT command received: " + msg);
+  // Parse JSON payload
+  StaticJsonDocument<256> doc;
+  DeserializationError err = deserializeJson(doc, payload, length);
   
-  // RELAY CONTROL COMMANDS
-  if (msg.indexOf("RELAY_CUTOFF") >= 0) {
-    Serial.println("🔒 RELAY_CUTOFF - Insufficient balance");
-    
-    relayLockedByServer = true;
-    relayState = false;
-    saveBillingState();
-    
-    // Send ACK
-    StaticJsonDocument<128> ackDoc;
-    ackDoc["command"] = "RELAY_CUTOFF";
-    ackDoc["status"] = "SUCCESS";
-    ackDoc["relayState"] = false;
-    ackDoc["timestamp"] = millis() / 1000;
-    
-    char ackBuffer[128];
-    serializeJson(ackDoc, ackBuffer);
-    client.publish(ackTopic.c_str(), ackBuffer);
-    
+  if (err) {
+    Serial.println("❌ JSON parse failed");
     return;
   }
   
-  if (msg.indexOf("RELAY_RESTORE") >= 0) {
-    Serial.println("🔓 RELAY_RESTORE - Balance recharged");
+  String cmd = doc["command"] | "";
+  
+  // ===============================
+  // RELAY CONTROL
+  // ===============================
+  if (cmd == "relay_on") {
+    if (relayLockedByServer) {
+      Serial.println("⚠️ Cannot turn ON - Relay locked by server");
+      publishCommandAck("relay_on", "FAILED", relayState);
+      return;
+    }
     
+    relayState = true;
+    Serial.println("🔌 Relay turned ON");
+    publishCommandAck("relay_on", "SUCCESS", relayState);
+  }
+  else if (cmd == "relay_off") {
+    relayState = false;
+    Serial.println("🔌 Relay turned OFF");
+    publishCommandAck("relay_off", "SUCCESS", relayState);
+  }
+  else if (cmd == "unlock_relay") {
     relayLockedByServer = false;
     relayState = true;
     saveBillingState();
-    
-    // Send ACK
-    StaticJsonDocument<128> ackDoc;
-    ackDoc["command"] = "RELAY_RESTORE";
-    ackDoc["status"] = "SUCCESS";
-    ackDoc["relayState"] = true;
-    ackDoc["timestamp"] = millis() / 1000;
-    
-    char ackBuffer[128];
-    serializeJson(ackDoc, ackBuffer);
-    client.publish(ackTopic.c_str(), ackBuffer);
-    
-    return;
+    Serial.println("🔓 Relay unlocked by server");
+    publishCommandAck("unlock_relay", "SUCCESS", relayState);
+  }
+  else if (cmd == "lock_relay") {
+    relayLockedByServer = true;
+    relayState = false;
+    saveBillingState();
+    Serial.println("🔒 Relay locked by server");
+    publishCommandAck("lock_relay", "SUCCESS", relayState);
   }
   
+  // ===============================
   // MODULE SCAN
-  if (msg.indexOf("START_MODULE_SCAN") >= 0) {
-    // Only allow scan if not locked
-    if (relayLockedByServer) {
-      Serial.println("⚠️ Module scan blocked - device locked");
-      return;
-    }
+  // ===============================
+  else if (cmd == "scan_modules") {
+    Serial.println("📡 Scanning for modules...");
     
-    Serial.println("🚀 START_MODULE_SCAN");
-    
-    ScanRequest scan;
-    memset(&scan, 0, sizeof(scan));
-    strcpy(scan.type, "SCAN_REQ");
+    ScanRequest req;
+    memset(&req, 0, sizeof(req));
+    strcpy(req.type, "SCAN_REQ");
     
     uint8_t broadcastAddr[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-    esp_err_t res = esp_now_send(broadcastAddr, (uint8_t*)&scan, sizeof(scan));
+    esp_now_send(broadcastAddr, (uint8_t*)&req, sizeof(req));
     
-    Serial.println(res == ESP_OK ? "📡 Scan broadcast sent" : "❌ Scan failed");
+    Serial.println("📤 Scan request broadcast sent");
   }
   
+  // ===============================
   // MODULE PAIRING
-  if (msg.indexOf("MODULE_PAIRED") >= 0) {
-    if (relayLockedByServer) {
-      Serial.println("⚠️ Module pairing blocked - device locked");
+  // ===============================
+  else if (cmd == "pair_module") {
+    String moduleId = doc["moduleId"] | "";
+    String secret = doc["secret"] | "";
+    
+    if (moduleId.length() == 0 || secret.length() == 0) {
+      Serial.println("❌ Invalid pairing request");
       return;
     }
     
-    Serial.println("🔐 MODULE_PAIRED");
+    Serial.print("🔗 Pairing request for: ");
+    Serial.println(moduleId);
     
-    int moduleIdStart = msg.indexOf("\"moduleId\":\"") + 12;
-    int moduleIdEnd = msg.indexOf("\"", moduleIdStart);
-    String moduleId = msg.substring(moduleIdStart, moduleIdEnd);
-    
-    int secretStart = msg.indexOf("\"secret\":\"") + 10;
-    int secretEnd = msg.indexOf("\"", secretStart);
-    String secret = msg.substring(secretStart, secretEnd);
-    
+    // Find module in scan results (not implementing full scan cache here)
+    // Broadcast pair request
     PairRequest pairReq;
     memset(&pairReq, 0, sizeof(pairReq));
     strcpy(pairReq.type, "PAIR_REQ");
-    moduleId.toCharArray(pairReq.moduleId, 16);
-    secret.toCharArray(pairReq.secret, 32);
+    strncpy(pairReq.moduleId, moduleId.c_str(), 15);
+    strncpy(pairReq.secret, secret.c_str(), 31);
     
     uint8_t broadcastAddr[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
     esp_now_send(broadcastAddr, (uint8_t*)&pairReq, sizeof(pairReq));
     
-    Serial.println("📡 PAIR_REQ sent");
+    Serial.println("📤 Pairing request sent");
   }
   
+  // ===============================
   // MODULE UNPAIRING
-  if (msg.indexOf("UNPAIR_MODULE") >= 0) {
-    Serial.println("🔓 UNPAIR_MODULE");
+  // ===============================
+  else if (cmd == "unpair_module") {
+    String moduleId = doc["moduleId"] | "";
     
-    int moduleIdStart = msg.indexOf("\"moduleId\":\"") + 12;
-    int moduleIdEnd = msg.indexOf("\"", moduleIdStart);
-    String moduleId = msg.substring(moduleIdStart, moduleIdEnd);
+    if (moduleId.length() == 0) {
+      Serial.println("❌ Invalid unpair request");
+      return;
+    }
     
-    UnpairCommand unpairCmd;
-    memset(&unpairCmd, 0, sizeof(unpairCmd));
-    strcpy(unpairCmd.type, "UNPAIR_CMD");
-    moduleId.toCharArray(unpairCmd.moduleId, 16);
+    Serial.print("🔓 Unpairing: ");
+    Serial.println(moduleId);
     
+    // Find and remove module
     for (int i = 0; i < pairedCount; i++) {
       if (strcmp(pairedModules[i].moduleId, moduleId.c_str()) == 0) {
+        // Remove ESP-NOW peer
+        esp_now_del_peer(pairedModules[i].macAddr);
+        
+        // Send unpair command
+        UnpairCommand unpairCmd;
+        memset(&unpairCmd, 0, sizeof(unpairCmd));
+        strcpy(unpairCmd.type, "UNPAIR");
+        strncpy(unpairCmd.moduleId, moduleId.c_str(), 15);
+        
         esp_now_send(pairedModules[i].macAddr, (uint8_t*)&unpairCmd, sizeof(unpairCmd));
-        break;
+        
+        // Shift array
+        for (int j = i; j < pairedCount - 1; j++) {
+          pairedModules[j] = pairedModules[j + 1];
+        }
+        pairedCount--;
+        
+        savePairedModules();
+        
+        Serial.println("✅ Module unpaired");
+        publishCommandAck("unpair_module", "SUCCESS", relayState);
+        return;
       }
     }
     
-    unpairModule(moduleId.c_str());
-    
-    char jsonBuffer[128];
-    snprintf(jsonBuffer, sizeof(jsonBuffer),
-      "{\"moduleId\":\"%s\",\"status\":\"unpaired\"}",
-      moduleId.c_str()
-    );
-    client.publish(pairAckTopic.c_str(), jsonBuffer);
+    Serial.println("⚠️ Module not found");
+    publishCommandAck("unpair_module", "FAILED", relayState);
   }
-}
-
-void setupMQTT() {
-  client.setServer(mqttServer, mqttPort);
-  client.setCallback(onMQTTMessage);
 }
 
 // =====================================
 // ESP-NOW RECEIVE CALLBACK
 // =====================================
-void onESPNowRecv(
-  const esp_now_recv_info_t* info,
-  const uint8_t* data,
-  int len
-) {
-  if (len < 16) return;
+void onESPNowRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
+  char msgType[16];
+  memcpy(msgType, data, 16);
   
-  char type[16];
-  memcpy(type, data, 16);
-  
-  if (strcmp(type, "SCAN_RESP") == 0) {
+  // --------------------------------------------------
+  // SCAN RESPONSE
+  // --------------------------------------------------
+  if (strcmp(msgType, "SCAN_RESP") == 0) {
     ScanResponse resp;
     memcpy(&resp, data, sizeof(resp));
     
-    if (isModulePaired(resp.moduleId)) {
-      return;
-    }
-    
-    Serial.print("📍 Found module: ");
+    Serial.println("📡 Scan response received:");
+    Serial.print("  Module ID: ");
     Serial.println(resp.moduleId);
+    Serial.print("  Capacity: ");
+    Serial.println(resp.capacity);
+    Serial.print("  MAC: ");
+    for (int i = 0; i < 6; i++) {
+      Serial.printf("%02X", info->src_addr[i]);
+      if (i < 5) Serial.print(":");
+    }
+    Serial.println();
     
-    if (!esp_now_is_peer_exist(info->src_addr)) {
+    // Publish to MQTT
+    StaticJsonDocument<128> doc;
+    doc["moduleId"] = resp.moduleId;
+    doc["capacity"] = resp.capacity;
+    
+    char macStr[18];
+    snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+             info->src_addr[0], info->src_addr[1], info->src_addr[2],
+             info->src_addr[3], info->src_addr[4], info->src_addr[5]);
+    doc["mac"] = macStr;
+    
+    char buffer[128];
+    serializeJson(doc, buffer);
+    
+    client.publish(scanTopic.c_str(), buffer);
+  }
+  
+  // --------------------------------------------------
+  // PAIR ACKNOWLEDGEMENT
+  // --------------------------------------------------
+  else if (strcmp(msgType, "PAIR_ACK") == 0) {
+    PairAck ack;
+    memcpy(&ack, data, sizeof(ack));
+    
+    Serial.println("🔗 Pair ACK received:");
+    Serial.print("  Module: ");
+    Serial.println(ack.moduleId);
+    Serial.print("  Success: ");
+    Serial.println(ack.success ? "YES" : "NO");
+    
+    if (ack.success && pairedCount < MAX_MODULES) {
+      // Add to paired list
+      strncpy(pairedModules[pairedCount].moduleId, ack.moduleId, 15);
+      memcpy(pairedModules[pairedCount].macAddr, info->src_addr, 6);
+      pairedModules[pairedCount].capacity = 0; // Will be updated later
+      pairedModules[pairedCount].isPaired = true;
+      
+      // Add ESP-NOW peer
       esp_now_peer_info_t peerInfo;
       memset(&peerInfo, 0, sizeof(peerInfo));
       memcpy(peerInfo.peer_addr, info->src_addr, 6);
       peerInfo.channel = WiFi.channel();
       peerInfo.encrypt = false;
       peerInfo.ifidx = WIFI_IF_STA;
-      esp_now_add_peer(&peerInfo);
-    }
-    
-    char jsonBuffer[128];
-    snprintf(jsonBuffer, sizeof(jsonBuffer),
-      "{\"moduleId\":\"%s\",\"capacity\":%d}",
-      resp.moduleId,
-      resp.capacity
-    );
-    
-    client.publish(scanTopic.c_str(), jsonBuffer);
-  }
-  
-  if (strcmp(type, "PAIR_ACK") == 0) {
-    PairAck ack;
-    memcpy(&ack, data, sizeof(ack));
-    
-    Serial.print("🔐 PAIR_ACK: ");
-    Serial.println(ack.success ? "✅ Success" : "❌ Failed");
-    
-    if (ack.success) {
-      int capacity = 0;
-      for (int i = 0; i < pairedCount; i++) {
-        if (strcmp(pairedModules[i].moduleId, ack.moduleId) == 0) {
-          capacity = pairedModules[i].capacity;
-          break;
-        }
+      
+      if (esp_now_add_peer(&peerInfo) == ESP_OK) {
+        pairedCount++;
+        savePairedModules();
+        Serial.println("✅ Module paired and saved");
       }
-      
-      savePairedModule(ack.moduleId, info->src_addr, capacity);
-      
-      char jsonBuffer[128];
-      snprintf(jsonBuffer, sizeof(jsonBuffer),
-        "{\"moduleId\":\"%s\",\"status\":\"paired\",\"success\":true}",
-        ack.moduleId
-      );
-      client.publish(pairAckTopic.c_str(), jsonBuffer);
     }
+    
+    // Publish ACK to MQTT
+    StaticJsonDocument<128> doc;
+    doc["moduleId"] = ack.moduleId;
+    doc["success"] = ack.success;
+    
+    char buffer[128];
+    serializeJson(doc, buffer);
+    
+    client.publish(pairAckTopic.c_str(), buffer);
   }
   
-  if (strcmp(type, "TELEMETRY") == 0) {
+  // --------------------------------------------------
+  // MODULE TELEMETRY
+  // --------------------------------------------------
+  else if (strcmp(msgType, "TELEMETRY") == 0) {
     ModuleTelemetry telem;
     memcpy(&telem, data, sizeof(telem));
+    
+    Serial.print("📊 TELEMETRY from ");
+    Serial.print(telem.moduleId);
+    Serial.print(" Unit ");
+    Serial.print(telem.unitIndex);
+    Serial.print(" | V: ");
+    Serial.print(telem.voltage);
+    Serial.print("V, I: ");
+    Serial.print(telem.current);
+    Serial.print("A, P: ");
+    Serial.print(telem.power);
+    Serial.println("W");
     
     bool found = false;
     for (int i = 0; i < moduleDataCount; i++) {
@@ -665,11 +804,12 @@ void onESPNowRecv(
         strcpy(moduleDataCache[i].health, telem.health);
         moduleDataCache[i].lastUpdate = millis();
         found = true;
+        Serial.println("  ✅ Updated existing cache entry");
         break;
       }
     }
     
-    if (!found && moduleDataCount < (MAX_MODULES * 2)) {
+    if (!found && moduleDataCount < (MAX_MODULES * 10)) {
       strcpy(moduleDataCache[moduleDataCount].moduleId, telem.moduleId);
       moduleDataCache[moduleDataCount].unitIndex = telem.unitIndex;
       moduleDataCache[moduleDataCount].voltage = telem.voltage;
@@ -679,7 +819,45 @@ void onESPNowRecv(
       strcpy(moduleDataCache[moduleDataCount].health, telem.health);
       moduleDataCache[moduleDataCount].lastUpdate = millis();
       moduleDataCount++;
+      Serial.print("  ✅ Added new cache entry (total: ");
+      Serial.print(moduleDataCount);
+      Serial.println(")");
     }
+  }
+  
+  // --------------------------------------------------
+  // MODULE FAULT (NEW)
+  // --------------------------------------------------
+  else if (strcmp(msgType, "FAULT") == 0) {
+    ModuleFault fault;
+    memcpy(&fault, data, sizeof(fault));
+    
+    Serial.println("🚨 FAULT received from module:");
+    Serial.print("  Module: ");
+    Serial.println(fault.moduleId);
+    Serial.print("  Unit: ");
+    Serial.println(fault.unitNumber);
+    Serial.print("  Type: ");
+    Serial.println(fault.faultType);
+    Serial.print("  Severity: ");
+    Serial.println(fault.severity);
+    Serial.print("  Description: ");
+    Serial.println(fault.description);
+    
+    // Forward fault to server
+    publishFault(
+      "module",
+      fault.moduleId,
+      fault.unitNumber,
+      fault.faultType,
+      fault.severity,
+      fault.description,
+      fault.measuredValue,
+      fault.thresholdValue,
+      fault.unit
+    );
+    
+    Serial.println("  ✅ Fault forwarded to server");
   }
 }
 
@@ -709,7 +887,7 @@ void publishTelemetry() {
     mainPower = 0.0;
   }
   
-  StaticJsonDocument<1024> doc;
+  StaticJsonDocument<2048> doc;  // Increased size for more modules
   
   doc["deviceId"] = deviceId;
   doc["timestamp"] = millis() / 1000;
@@ -725,6 +903,9 @@ void publishTelemetry() {
   
   JsonArray modules = doc.createNestedArray("modules");
   
+  Serial.print("📊 Building telemetry | Module data cache entries: ");
+  Serial.println(moduleDataCount);
+  
   // Only include module data if not locked
   if (!relayLockedByServer) {
     for (int i = 0; i < pairedCount; i++) {
@@ -732,6 +913,9 @@ void publishTelemetry() {
       
       bool hasData = false;
       JsonArray units;
+      
+      Serial.print("  Checking module: ");
+      Serial.println(pairedModules[i].moduleId);
       
       for (int j = 0; j < moduleDataCount; j++) {
         if (strcmp(moduleDataCache[j].moduleId, pairedModules[i].moduleId) == 0) {
@@ -750,19 +934,40 @@ void publishTelemetry() {
             unit["power"] = round(moduleDataCache[j].power);
             unit["relayState"] = moduleDataCache[j].relayState;
             unit["health"] = moduleDataCache[j].health;
+            
+            Serial.print("    ✅ Added Unit ");
+            Serial.println(moduleDataCache[j].unitIndex);
+          } else {
+            Serial.print("    ⚠️ Unit ");
+            Serial.print(moduleDataCache[j].unitIndex);
+            Serial.println(" data too old");
           }
         }
+      }
+      
+      if (!hasData) {
+        Serial.println("    ⚠️ No recent data found");
       }
     }
   }
   
-  char buffer[1024];
-  serializeJson(doc, buffer);
+  char buffer[2048];
+  size_t jsonSize = serializeJson(doc, buffer);
+  
+  Serial.print("📊 JSON size: ");
+  Serial.print(jsonSize);
+  Serial.println(" bytes");
   
   if (client.publish(telemetryTopic.c_str(), buffer)) {
     Serial.println("📊 Telemetry published");
+    Serial.print("  Modules included: ");
+    Serial.println(modules.size());
   } else {
     Serial.println("❌ Telemetry publish failed");
+    Serial.print("  MQTT state: ");
+    Serial.println(client.state());
+    Serial.print("  Buffer size: ");
+    Serial.println(client.getBufferSize());
   }
 }
 
@@ -778,6 +983,7 @@ void setup() {
   Serial.println(firmwareVersion);
   Serial.print("Deployed: ");
   Serial.println(deploymentDate);
+  Serial.println("🧪 FAULT TESTING MODE ENABLED");
   
   // Save device info
   saveDeviceInfo();
@@ -788,6 +994,10 @@ void setup() {
   // Load paired modules
   loadPairedModules();
   
+  // Connect WiFi FIRST
+  connectWiFi();
+  
+  // Initialize ESP-NOW AFTER WiFi
   WiFi.mode(WIFI_STA);
   
   if (esp_now_init() != ESP_OK) {
@@ -797,28 +1007,29 @@ void setup() {
   
   Serial.println("✅ ESP-NOW initialized");
   
+  // Register receive callback
   esp_now_register_recv_cb(onESPNowRecv);
   
-  esp_now_peer_info_t peerInfo;
-  memset(&peerInfo, 0, sizeof(peerInfo));
-  memset(peerInfo.peer_addr, 0xFF, 6);
-  peerInfo.channel = 0;
-  peerInfo.encrypt = false;
-  peerInfo.ifidx = WIFI_IF_STA;
-  
-  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
-    Serial.println("❌ Failed to add broadcast peer");
-  }
-  
-  connectWiFi();
-  
+  // Get WiFi channel and set ESP-NOW to same channel
   uint8_t channel = WiFi.channel();
   esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
   
-  esp_now_del_peer(peerInfo.peer_addr);
-  peerInfo.channel = channel;
-  esp_now_add_peer(&peerInfo);
+  Serial.print("📶 ESP-NOW Channel: ");
+  Serial.println(channel);
   
+  // Add broadcast peer
+  esp_now_peer_info_t peerInfo;
+  memset(&peerInfo, 0, sizeof(peerInfo));
+  memset(peerInfo.peer_addr, 0xFF, 6);
+  peerInfo.channel = channel;
+  peerInfo.encrypt = false;
+  peerInfo.ifidx = WIFI_IF_STA;
+  
+  if (esp_now_add_peer(&peerInfo) == ESP_OK) {
+    Serial.println("✅ Broadcast peer added");
+  }
+  
+  // Re-add all paired modules as peers
   for (int i = 0; i < pairedCount; i++) {
     if (pairedModules[i].isPaired) {
       if (!esp_now_is_peer_exist(pairedModules[i].macAddr)) {
@@ -828,7 +1039,11 @@ void setup() {
         modulePeer.channel = channel;
         modulePeer.encrypt = false;
         modulePeer.ifidx = WIFI_IF_STA;
-        esp_now_add_peer(&modulePeer);
+        
+        if (esp_now_add_peer(&modulePeer) == ESP_OK) {
+          Serial.print("✅ Re-added peer: ");
+          Serial.println(pairedModules[i].moduleId);
+        }
       }
     }
   }
@@ -845,6 +1060,7 @@ void setup() {
   // Initialize timing
   lastBillingSync = millis();
   periodStartTimestamp = millis() / 1000;
+  lastFaultTest = millis();
 }
 
 // =====================================
@@ -879,6 +1095,12 @@ void loop() {
   if (now - lastTelemetry >= TELEMETRY_INTERVAL) {
     publishTelemetry();
     lastTelemetry = now;
+  }
+  
+  // 🧪 FAULT TESTING - Send test fault every 10 seconds
+  if (now - lastFaultTest >= FAULT_TEST_INTERVAL) {
+    testFaultPublishing();
+    lastFaultTest = now;
   }
   
   delay(100);
