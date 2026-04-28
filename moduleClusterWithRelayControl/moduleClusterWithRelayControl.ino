@@ -7,7 +7,7 @@
 // WIFI CONFIG  (MUST MATCH MAIN METER)
 // ======================================================
 const char* ssid     = "boom";
-const char* password = "123123123456";
+const char* password = "123123123033";
 
 // ======================================================
 // SLAVE MODULE IDENTITY (FROM ADMIN TXT FILE)
